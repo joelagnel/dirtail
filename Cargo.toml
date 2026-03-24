@@ -1,0 +1,11 @@
+[package]
+name = "dirtail"
+version = "0.1.0"
+edition = "2021"
+description = "Tail files matching a glob pattern in a directory, with live watching and color"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+notify = "6"
+glob = "0.3"
+colored = "2"
