@@ -39,6 +39,10 @@ struct Cli {
     /// Glob pattern to match files (named flag)
     #[arg(long = "pattern", value_name = "PATTERN")]
     pattern_flag: Option<String>,
+
+    /// Maximum number of most-recently-modified files to tail (0 = unlimited).
+    #[arg(long = "max-files", value_name = "N", default_value = "50")]
+    max_files: usize,
 }
 
 impl Cli {
@@ -275,58 +279,78 @@ fn main() {
     let (tx, rx) = mpsc::channel::<LogLine>();
     let registry = Arc::new(Mutex::new(FileRegistry::new()));
 
-    // Scan existing files, sorted by name for deterministic color assignment
-    let mut existing: Vec<PathBuf> = dir
+    let max_files = cli.max_files;
+
+    // Scan existing files, collecting mtimes in one pass (single stat per file).
+    let mut candidates: Vec<(PathBuf, Option<std::time::SystemTime>)> = dir
         .read_dir()
         .expect("cannot read directory")
         .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .filter(|p| {
-            p.file_name()
+        .filter_map(|e| {
+            let path = e.path();
+            let meta = path.metadata().ok()?;
+            if !meta.is_file() { return None; }
+            let matches = path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .map(|n| glob_pattern.matches(n))
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !matches { return None; }
+            let mtime = meta.modified().ok();
+            Some((path, mtime))
         })
         .collect();
-    existing.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+    // Keep only the N most recently modified files to avoid "too many open files".
+    // Sort descending (newest first) then truncate; watcher thread is unaffected.
+    candidates.sort_by(|(_, a), (_, b)| b.cmp(a));
+    let total_matched = candidates.len();
+    if max_files > 0 && total_matched > max_files {
+        candidates.truncate(max_files);
+    }
+
+    // Sort by name for deterministic color assignment.
+    candidates.sort_by(|(a, _), (b, _)| a.file_name().cmp(&b.file_name()));
 
     // Startup banner
     println!("{}", "=== dirtail ===".bold());
     println!("  Dir     : {}", dir.display().to_string().cyan());
     println!("  Pattern : {}", pattern_str.cyan());
-    if existing.is_empty() {
+    if candidates.is_empty() {
         println!("  {}", "No existing files match. Watching for new files...".yellow());
+    } else if max_files > 0 && total_matched > max_files {
+        println!(
+            "  {}",
+            format!(
+                "Tailing {} of {} matching file(s) (most recent; use --max-files to change):",
+                candidates.len(),
+                total_matched
+            )
+            .yellow()
+        );
+        for (p, _) in &candidates {
+            println!("    {}", p.display().to_string().green());
+        }
     } else {
-        println!("  Tailing {} existing file(s):", existing.len());
-        for p in &existing {
+        println!("  Tailing {} existing file(s):", candidates.len());
+        for (p, _) in &candidates {
             println!("    {}", p.display().to_string().green());
         }
     }
     println!("{}", "===============".bold());
 
-    // Phase A: name-sorted (above) → assign color indices
-    let mut file_colors: Vec<(PathBuf, usize)> = Vec::new();
-    for path in existing {
+    // Phase A: name-sorted → assign color indices; carry saved mtimes forward.
+    let mut file_colors_mtime: Vec<(PathBuf, usize, Option<std::time::SystemTime>)> = Vec::new();
+    for (path, mtime) in candidates {
         let mut reg = registry.lock().unwrap();
         if let Some(idx) = reg.insert(path.clone()) {
             drop(reg);
-            file_colors.push((path, idx));
+            file_colors_mtime.push((path, idx, mtime));
         }
     }
 
-    // Phase B: mtime-sort → read initial lines in mtime order (oldest first),
-    // then spawn follow threads. This ensures the visual "age" of output decreases
-    // downward: oldest-modified files appear first, most-recently-modified last.
-    // Cache mtimes before sorting to avoid redundant stat() calls in the comparator.
-    let mut file_colors_mtime: Vec<(PathBuf, usize, Option<std::time::SystemTime>)> =
-        file_colors
-            .into_iter()
-            .map(|(p, idx)| {
-                let mtime = p.metadata().ok().and_then(|m| m.modified().ok());
-                (p, idx, mtime)
-            })
-            .collect();
+    // Phase B: sort ascending by mtime so the most-recently-modified file's lines
+    // appear last (at the bottom of the terminal), matching the first entry of `ls -lt`.
     file_colors_mtime.sort_by(|(_, _, a), (_, _, b)| a.cmp(b));
     for (path, idx, _) in file_colors_mtime {
         let start_pos = read_initial_tail(&path, idx, &tx);
@@ -573,6 +597,7 @@ mod tests {
             pattern_pos: pattern_pos.map(String::from),
             dir_flag: dir_flag.map(String::from),
             pattern_flag: pattern_flag.map(String::from),
+            max_files: 50,
         }
     }
 
@@ -768,5 +793,76 @@ mod tests {
 
         // Lines must arrive oldest-first: old, mid, new
         assert_eq!(received, vec!["old line", "mid line", "new line"]);
+    }
+
+    // ── max_files truncation ──────────────────────────────────────────────────
+
+    /// Helper: simulate the scan+truncate step from main() on a given list of
+    /// (path, mtime) pairs, returning the paths that survive after keeping the
+    /// `max_files` most recently modified entries.
+    fn apply_max_files(
+        mut candidates: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+        max_files: usize,
+    ) -> Vec<PathBuf> {
+        candidates.sort_by(|(_, a), (_, b)| b.cmp(a)); // descending: newest first
+        if max_files > 0 && candidates.len() > max_files {
+            candidates.truncate(max_files);
+        }
+        candidates.into_iter().map(|(p, _)| p).collect()
+    }
+
+    #[test]
+    fn max_files_keeps_newest_n_files() {
+        // Five files with distinct mtimes; keep only the 3 newest.
+        let base = std::time::SystemTime::UNIX_EPOCH;
+        let t = |secs: u64| Some(base + std::time::Duration::from_secs(secs));
+
+        let a = PathBuf::from("/a"); // oldest
+        let b = PathBuf::from("/b");
+        let c = PathBuf::from("/c");
+        let d = PathBuf::from("/d");
+        let e = PathBuf::from("/e"); // newest
+
+        let candidates = vec![
+            (a.clone(), t(1)),
+            (b.clone(), t(2)),
+            (c.clone(), t(3)),
+            (d.clone(), t(4)),
+            (e.clone(), t(5)),
+        ];
+        let kept = apply_max_files(candidates, 3);
+
+        // Must keep the 3 newest: c, d, e
+        assert_eq!(kept.len(), 3);
+        assert!(kept.contains(&c));
+        assert!(kept.contains(&d));
+        assert!(kept.contains(&e));
+        assert!(!kept.contains(&a));
+        assert!(!kept.contains(&b));
+    }
+
+    #[test]
+    fn max_files_zero_keeps_all() {
+        let base = std::time::SystemTime::UNIX_EPOCH;
+        let t = |secs: u64| Some(base + std::time::Duration::from_secs(secs));
+        let candidates = vec![
+            (PathBuf::from("/a"), t(1)),
+            (PathBuf::from("/b"), t(2)),
+            (PathBuf::from("/c"), t(3)),
+        ];
+        let kept = apply_max_files(candidates, 0);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn max_files_larger_than_count_keeps_all() {
+        let base = std::time::SystemTime::UNIX_EPOCH;
+        let t = |secs: u64| Some(base + std::time::Duration::from_secs(secs));
+        let candidates = vec![
+            (PathBuf::from("/a"), t(1)),
+            (PathBuf::from("/b"), t(2)),
+        ];
+        let kept = apply_max_files(candidates, 100);
+        assert_eq!(kept.len(), 2);
     }
 }

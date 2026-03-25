@@ -52,12 +52,16 @@ dirtail --dir /var/log --pattern '*.log'
 
 ### Arguments
 
-| Argument            | Description                                      | Default |
-|---------------------|--------------------------------------------------|---------|
-| `DIR`               | Directory to watch                               | `.`     |
-| `PATTERN`           | Glob pattern to match files                      | `*`     |
-| `--dir <DIR>`       | Directory to watch (named flag)                  | `.`     |
-| `--pattern <PAT>`   | Glob pattern to match files (named flag)         | `*`     |
+| Argument              | Description                                                                 | Default |
+|-----------------------|-----------------------------------------------------------------------------|---------|
+| `DIR`                 | Directory to watch                                                          | `.`     |
+| `PATTERN`             | Glob pattern to match files                                                 | `*`     |
+| `--dir <DIR>`         | Directory to watch (named flag)                                             | `.`     |
+| `--pattern <PAT>`     | Glob pattern to match files (named flag)                                    | `*`     |
+| `--max-files <N>`     | Max existing files to tail at startup (most recent by mtime; 0 = unlimited) | `50`    |
+
+The `--max-files` limit applies only to the initial scan of existing files.  New files
+created after startup are always picked up by the inotify watcher, regardless of the limit.
 
 ## Architecture
 
