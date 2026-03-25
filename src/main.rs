@@ -318,11 +318,17 @@ fn main() {
     // Phase B: mtime-sort → read initial lines in mtime order (oldest first),
     // then spawn follow threads. This ensures the visual "age" of output decreases
     // downward: oldest-modified files appear first, most-recently-modified last.
-    file_colors.sort_by(|(a, _), (b, _)| {
-        a.metadata().ok().and_then(|m| m.modified().ok())
-            .cmp(&b.metadata().ok().and_then(|m| m.modified().ok()))
-    });
-    for (path, idx) in file_colors {
+    // Cache mtimes before sorting to avoid redundant stat() calls in the comparator.
+    let mut file_colors_mtime: Vec<(PathBuf, usize, Option<std::time::SystemTime>)> =
+        file_colors
+            .into_iter()
+            .map(|(p, idx)| {
+                let mtime = p.metadata().ok().and_then(|m| m.modified().ok());
+                (p, idx, mtime)
+            })
+            .collect();
+    file_colors_mtime.sort_by(|(_, _, a), (_, _, b)| a.cmp(b));
+    for (path, idx, _) in file_colors_mtime {
         let start_pos = read_initial_tail(&path, idx, &tx);
         spawn_tail_thread(path, start_pos, idx, tx.clone());
     }
@@ -709,5 +715,58 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(msg.line, "DEBUG: written after start");
+    }
+
+    #[test]
+    fn startup_initial_lines_emitted_in_mtime_ascending_order() {
+        let old_path = unique_temp("log");
+        let mid_path = unique_temp("log");
+        let new_path = unique_temp("log");
+        std::fs::write(&old_path, "old line\n").unwrap();
+        std::fs::write(&mid_path, "mid line\n").unwrap();
+        std::fs::write(&new_path, "new line\n").unwrap();
+
+        // Set mtimes: old (2020) < mid (2023) < new (2026)
+        std::process::Command::new("touch")
+            .args(["-t", "202001010000", old_path.to_str().unwrap()])
+            .status().unwrap();
+        std::process::Command::new("touch")
+            .args(["-t", "202301010000", mid_path.to_str().unwrap()])
+            .status().unwrap();
+        std::process::Command::new("touch")
+            .args(["-t", "202601010000", new_path.to_str().unwrap()])
+            .status().unwrap();
+
+        // Simulate Phase A: color assignment (intentionally not in mtime order)
+        let file_colors: Vec<(PathBuf, usize)> = vec![
+            (new_path.clone(), 0),
+            (old_path.clone(), 1),
+            (mid_path.clone(), 2),
+        ];
+
+        // Simulate Phase B: cache mtimes, sort ascending (same logic as main())
+        let mut file_colors_mtime: Vec<(PathBuf, usize, Option<std::time::SystemTime>)> =
+            file_colors
+                .into_iter()
+                .map(|(p, idx)| {
+                    let mtime = p.metadata().ok().and_then(|m| m.modified().ok());
+                    (p, idx, mtime)
+                })
+                .collect();
+        file_colors_mtime.sort_by(|(_, _, a), (_, _, b)| a.cmp(b));
+
+        let (tx, rx) = mpsc::channel::<LogLine>();
+        for (path, idx, _) in &file_colors_mtime {
+            read_initial_tail(path, *idx, &tx);
+        }
+        drop(tx);
+
+        let received: Vec<String> = rx.iter().map(|m| m.line).collect();
+        let _ = std::fs::remove_file(&old_path);
+        let _ = std::fs::remove_file(&mid_path);
+        let _ = std::fs::remove_file(&new_path);
+
+        // Lines must arrive oldest-first: old, mid, new
+        assert_eq!(received, vec!["old line", "mid line", "new line"]);
     }
 }
