@@ -150,7 +150,53 @@ impl FileRegistry {
 
 const TAIL_LINES: usize = 10;
 
-fn spawn_tail_thread(path: PathBuf, seek_to_end: bool, color_idx: usize, tx: Sender<LogLine>) {
+/// Read the last TAIL_LINES lines of `path` synchronously, send them to `tx`,
+/// and return the file's EOF position (used as `start_pos` for the follow thread).
+fn read_initial_tail(path: &Path, color_idx: usize, tx: &Sender<LogLine>) -> u64 {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("dirtail: cannot open {:?}: {}", path, e);
+            return 0;
+        }
+    };
+    let mut reader = BufReader::new(file);
+    // Ring buffer: keep only the last TAIL_LINES lines without reading all into memory.
+    let mut ring: [String; TAIL_LINES] = Default::default();
+    let mut count: usize = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                ring[count % TAIL_LINES] =
+                    line.trim_end_matches(&['\n', '\r'][..]).to_string();
+                count += 1;
+            }
+            Err(e) => {
+                eprintln!("dirtail: read error on {:?}: {}", path, e);
+                break;
+            }
+        }
+    }
+    let emit_count = count.min(TAIL_LINES);
+    let start_slot = if count <= TAIL_LINES { 0 } else { count % TAIL_LINES };
+    for i in 0..emit_count {
+        let slot = (start_slot + i) % TAIL_LINES;
+        let _ = tx.send(LogLine {
+            path: path.to_path_buf(),
+            line: ring[slot].clone(),
+            color_idx,
+        });
+    }
+    reader.stream_position().unwrap_or(0)
+}
+
+/// Seek to `start_pos` and follow new content. Use `start_pos = 0` for new files
+/// (follow from the beginning); pass the value returned by `read_initial_tail`
+/// for pre-existing files (follow from EOF).
+fn spawn_tail_thread(path: PathBuf, start_pos: u64, color_idx: usize, tx: Sender<LogLine>) {
     thread::spawn(move || {
         let file = match File::open(&path) {
             Ok(f) => f,
@@ -159,46 +205,12 @@ fn spawn_tail_thread(path: PathBuf, seek_to_end: bool, color_idx: usize, tx: Sen
                 return;
             }
         };
-
         let mut reader = BufReader::new(file);
-
-        if seek_to_end {
-            // Use a fixed-size ring buffer to avoid reading the entire file into memory.
-            // Only the last TAIL_LINES lines are kept at any time.
-            let mut ring: [String; TAIL_LINES] = Default::default();
-            let mut count: usize = 0;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        ring[count % TAIL_LINES] =
-                            line.trim_end_matches(&['\n', '\r'][..]).to_string();
-                        count += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("dirtail: read error on {:?}: {}", path, e);
-                        return;
-                    }
-                }
+        if start_pos > 0 {
+            if let Err(e) = reader.seek(SeekFrom::Start(start_pos)) {
+                eprintln!("dirtail: seek error on {:?}: {}", path, e);
+                return;
             }
-            let emit_count = count.min(TAIL_LINES);
-            let start_slot = if count <= TAIL_LINES { 0 } else { count % TAIL_LINES };
-            for i in 0..emit_count {
-                let slot = (start_slot + i) % TAIL_LINES;
-                if tx
-                    .send(LogLine {
-                        path: path.clone(),
-                        line: ring[slot].clone(),
-                        color_idx,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            // Reader is now at EOF; follow loop continues below
         }
 
         // Follow loop: poll for new data every 100ms
@@ -293,13 +305,26 @@ fn main() {
     }
     println!("{}", "===============".bold());
 
-    // Spawn tail threads for existing files
+    // Phase A: name-sorted (above) → assign color indices
+    let mut file_colors: Vec<(PathBuf, usize)> = Vec::new();
     for path in existing {
         let mut reg = registry.lock().unwrap();
         if let Some(idx) = reg.insert(path.clone()) {
             drop(reg);
-            spawn_tail_thread(path, true, idx, tx.clone());
+            file_colors.push((path, idx));
         }
+    }
+
+    // Phase B: mtime-sort → read initial lines in mtime order (oldest first),
+    // then spawn follow threads. This ensures the visual "age" of output decreases
+    // downward: oldest-modified files appear first, most-recently-modified last.
+    file_colors.sort_by(|(a, _), (b, _)| {
+        a.metadata().ok().and_then(|m| m.modified().ok())
+            .cmp(&b.metadata().ok().and_then(|m| m.modified().ok()))
+    });
+    for (path, idx) in file_colors {
+        let start_pos = read_initial_tail(&path, idx, &tx);
+        spawn_tail_thread(path, start_pos, idx, tx.clone());
     }
 
     // Spawn directory watcher thread
@@ -339,7 +364,7 @@ fn main() {
                                             "[dirtail] new file:".bold(),
                                             path.display().to_string().green()
                                         );
-                                        spawn_tail_thread(path, false, idx, tx_clone.clone());
+                                        spawn_tail_thread(path, 0, idx, tx_clone.clone());
                                     }
                                 }
                             }
@@ -599,15 +624,10 @@ mod tests {
         std::fs::write(&path, content).unwrap();
 
         let (tx, rx) = mpsc::channel::<LogLine>();
-        spawn_tail_thread(path.clone(), true, 0, tx);
+        read_initial_tail(&path, 0, &tx);
+        drop(tx);
 
-        let mut received = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while received.len() < 10 && std::time::Instant::now() < deadline {
-            if let Ok(msg) = rx.recv_timeout(Duration::from_millis(200)) {
-                received.push(msg.line);
-            }
-        }
+        let received: Vec<String> = rx.iter().map(|m| m.line).collect();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(received.len(), 10);
@@ -621,15 +641,10 @@ mod tests {
         std::fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
 
         let (tx, rx) = mpsc::channel::<LogLine>();
-        spawn_tail_thread(path.clone(), true, 0, tx);
+        read_initial_tail(&path, 0, &tx);
+        drop(tx);
 
-        let mut received = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while received.len() < 3 && std::time::Instant::now() < deadline {
-            if let Ok(msg) = rx.recv_timeout(Duration::from_millis(200)) {
-                received.push(msg.line);
-            }
-        }
+        let received: Vec<String> = rx.iter().map(|m| m.line).collect();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(received, vec!["line 1", "line 2", "line 3"]);
@@ -641,7 +656,7 @@ mod tests {
         std::fs::File::create(&path).unwrap(); // empty
 
         let (tx, rx) = mpsc::channel::<LogLine>();
-        spawn_tail_thread(path.clone(), false, 0, tx);
+        spawn_tail_thread(path.clone(), 0, 0, tx);
         thread::sleep(Duration::from_millis(150));
 
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -660,9 +675,10 @@ mod tests {
         std::fs::write(&path, "existing\n").unwrap();
 
         let (tx, rx) = mpsc::channel::<LogLine>();
-        spawn_tail_thread(path.clone(), true, 0, tx);
+        let start_pos = read_initial_tail(&path, 0, &tx);
         // drain the initial line
         let _ = rx.recv_timeout(Duration::from_secs(2));
+        spawn_tail_thread(path.clone(), start_pos, 0, tx);
         thread::sleep(Duration::from_millis(200));
 
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -681,7 +697,8 @@ mod tests {
         std::fs::write(&path, "").unwrap();
 
         let (tx, rx) = mpsc::channel::<LogLine>();
-        spawn_tail_thread(path.clone(), true, 0, tx); // existing but empty
+        let start_pos = read_initial_tail(&path, 0, &tx); // existing but empty
+        spawn_tail_thread(path.clone(), start_pos, 0, tx);
         thread::sleep(Duration::from_millis(150));
 
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
